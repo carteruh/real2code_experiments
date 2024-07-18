@@ -9,12 +9,15 @@ import argparse
 from blenderproc.python.types.BoneUtility import get_constraint
 from blenderproc.python.types.MeshObjectUtility import MeshObject
 from blenderproc.python.writer.WriterUtility import _WriterUtility
+from blenderproc.python.utility.DefaultConfig import DefaultConfig
+from blenderproc.python.renderer import RendererUtility
 import h5py
 import bpy
 from bpy import context
 from PIL import Image
 import trimesh
 import json 
+
 """ 
 Latest: 
 - for each loop: 
@@ -65,28 +68,43 @@ import os
 import numpy as np
 from blenderproc.python.utility.Utility import Utility
 
-
-def clean_up_urdf(fname, np_random, open_drawer=True, margin=0.8):
+    
+def clean_up_urdf(fname, np_random, open_drawer=True, margin=0.8, random_joint=False):
     # print(f"Warning!! Opening all the drawers fully now")
     parsed = etree.parse(fname)
     root = parsed.getroot()
     # add effort and velocity limits to all joints
     for joint in root.findall('joint'):
+        print({joint.attrib['type']})
         limit_elem = joint.find('limit')
         if limit_elem is None:
             limit_elem = etree.SubElement(joint, 'limit')
         limit_elem.attrib['effort'] = '100'
         limit_elem.attrib['velocity'] = '100'
-        if open_drawer and joint.attrib['type'] == 'prismatic': # drawers
-            _upper = limit_elem.attrib['upper']
-            _upper = np_random.uniform(float(_upper) * margin, float(_upper))
+        if joint.attrib['type'] == 'prismatic': # drawers
+            if open_drawer:
+                if random_joint:
+                    _upper = limit_elem.attrib['upper']
+                    _upper = np_random.uniform(float(_upper) * margin, float(_upper))
+                else:
+                    _upper = limit_elem.attrib['upper']
+                    _upper = float(_upper)
+            else:
+                _upper = limit_elem.attrib['lower']
+                _upper = float(_upper)
+
+            
             # _upper = float(_upper)# NOTE: open the drawer fully!
             _axis = joint.find('axis').attrib['xyz']
             _axis = np.array(_axis.split(' ')).astype(np.float)
             _offset = _axis * _upper
             child = joint.find('child')
             # print(_offset)
-            if child is not None:
+            
+            '''
+            We take the child link of the joint and find its visual components. We then look for the origin coordinate attributes inside visual and modify it to the proposed offset joint state
+            '''
+            if child is not None: 
                 child_link = child.attrib['link']
                 child_link_elem = [link_elem for link_elem in root.findall('link') if link_elem.attrib['name'] == child_link]
                 
@@ -95,13 +113,16 @@ def clean_up_urdf(fname, np_random, open_drawer=True, margin=0.8):
                     # this doesn't work:
                     #  origin_elem = etree.SubElement(_elem, 'origin')
                     # origin_elem.attrib['xyz'] = ' '.join([str(x) for x in _offset])
+                    
                     visuals = _elem.findall('visual')
                     for visual in visuals:
                         ori = visual.find('origin') 
                         if ori is not None:
                             xyz = ori.attrib['xyz'].split(' ')
                             xyz = np.array(xyz).astype(np.float) + _offset
+                            print(xyz)
                             ori.attrib['xyz'] = ' '.join([str(x) for x in xyz])
+                                
                     
     tmp_fname = fname.replace('.urdf', '_tmp.urdf')
     parsed.write(tmp_fname, pretty_print=True)
@@ -155,7 +176,7 @@ def simplify_urdf(fname, mesh_dir="blender_meshes"):
             mesh_elem = etree.SubElement(geometry_elem, 'mesh', filename=f"{mesh_dir}/{link_name}.obj")
     return parsed
 
-def set_hinge_joints(obj, np_random, margin=0.4, randomize_jnt=True, high_margin=None):
+def set_hinge_joints(obj, np_random, margin=0.4, randomize_jnt=True, high_margin=None, fully_open= False):
     """ only handles revolute joints, prismatic joints are handled in urdf for now"""
     links = obj.links 
     joint_rots = dict()
@@ -167,7 +188,21 @@ def set_hinge_joints(obj, np_random, margin=0.4, randomize_jnt=True, high_margin
         bone = link.fk_bone
         c = get_constraint(bone=bone, constraint_name='Limit Rotation') 
         axis = link._determine_rotation_axis(bone=bone)
-        if c is not None:
+        
+        if link.joint_type == 'continuous':
+            max_value = {"x": 3.14, "y": 3.14, "z": 3.14}
+            min_value = {"x": -3.14, "y": -3.14, "z": -3.14}
+            if randomize_jnt:
+                   value = (
+                    np_random.uniform(-3.14, 3.14),
+                    np_random.uniform(-3.14, 3.14),
+                    np_random.uniform(-3.14, 3.14)
+                )
+            else:
+                value = (0, 0, 0)  # Default to 0 if not randomizing
+            link.set_rotation_euler_fk(rotation_euler=value)
+            joint_rots[link_name] = value
+        elif c is not None and link.joint_type == 'revolute':
             max_value = {"x": c.max_x, "y": c.max_y, "z": c.max_z}[axis.lower()]
             min_value = {"x": c.min_x, "y": c.min_y, "z": c.min_z}[axis.lower()]
             # set rotation NOTE possible that max_value == 0, min_value is negative 
@@ -177,9 +212,25 @@ def set_hinge_joints(obj, np_random, margin=0.4, randomize_jnt=True, high_margin
                 value = np_random.uniform(min_value + (max_value - min_value) * margin, max_value)
                 link.set_rotation_euler_fk(rotation_euler=value)
             else:
-                value = min_value
-                link.set_rotation_euler_fk(rotation_euler=value)
+                if fully_open:
+                    value = max_value
+                    link.set_rotation_euler_fk(rotation_euler=value)
+                else:
+                    value = min_value
+                    link.set_rotation_euler_fk(rotation_euler=value)
             joint_rots[link_name] = value 
+        # elif link.joint_type == 'prismatic':
+        #     if c is not None:
+        #         max_value = {"x": c.max_x, "y": c.max_y, "z": c.max_z}
+        #         min_value = {"x": c.min_x, "y": c.min_y, "z": c.min_z}
+        #         if randomize_jnt:
+        #             if high_margin is not None:
+        #                 max_value *= high_margin
+        #             value = np_random.uniform(min_value + (max_value - min_value) * margin, max_value)
+        #         else:
+        #             value = max_value if fully_open else min_value
+                
+        #         link.set_location(location=value)
         else:
             joint_rots[link_name] = None
     return joint_rots
@@ -232,7 +283,7 @@ def resample_lights(num_lights, init_lights=[], np_random=np.random.RandomState(
     return lights 
 
 def save_render_data(data, camera_infos, output_path, save_mask_png=False, try_load=True):
-    """ regroup data by frame, then save individually """
+    """ regroup data by loop, then save individually """
     regroup = []
     num_frames = len(data["colors"])
     all_instance_attribute_maps = data.get("instance_attribute_maps", None)
@@ -404,7 +455,6 @@ def merge_export_meshs(args, obj, fname, output_path, merged_mesh_folder = "blen
     return num_merged
 
 def process_folder(args, folder):
-    # bproc.clean_up()
     if len(folder.split('/')) > 1:
         folder = folder.split('/')[-1]
     folder_id = int(folder)
@@ -425,7 +475,6 @@ def process_folder(args, folder):
             os.remove(f)
     render_loops = []
     for loop in range(args.num_loops):
-        # save
         output_folder = join(output_path, f"loop_{loop}")
         if (not args.overwrite) and os.path.exists(output_folder):
             if len(glob(join(output_folder, '*.png'))) > 0:
@@ -437,99 +486,141 @@ def process_folder(args, folder):
         return
     
     open_drawer = True
-    tmp_fname = clean_up_urdf(fname, np_random, open_drawer=open_drawer, margin=0.2) 
-    obj = bproc.loader.load_urdf(urdf_file=tmp_fname)
-    # get the size of obj     
-    children_bbox = [] # each bound_box is (8, 3)
-    for child in obj.get_children():
-        mat = child.get_local2world_mat()
-        global_corner = np.array(child.get_bound_box()) @ mat[:3, :3].T + mat[:3, 3]
-        children_bbox.append(global_corner)
-    children_bbox = np.array(children_bbox)
-    min_bound = np.min(children_bbox[:, 0, :], axis=0)
-    max_bound = np.max(children_bbox[:, 1, :], axis=0)
-    obj_center = (min_bound + max_bound) / 2
-    obj_size = max_bound - min_bound
-    # breakpoint() 
-    obj_volume = np.prod(obj_size)
-    if obj_volume < 2:
-        cam_dist, cam_height = 3.6, 0.3
-    elif obj_volume < 3.5:
-        cam_dist, cam_height = 3.9, 0.35
-    elif obj_volume < 5:
-        cam_dist, cam_height = 3.9, 0.6
-    else: 
-        cam_dist, cam_height = 3.7, 0.7
-    
-    rotation_min, rotation_max = CAM_ROTATION_MIN, CAM_ROTATION_MAX
-    jnt_margin = 0.1
-    if args.folder == '30666':
-        cam_dist, cam_height = 3.6, 0.9
-    if args.folder == "22367":
-        cam_dist, cam_height = 3.3, 0.7 
-        rotation_min, rotation_max = np.pi/2 + np.pi/3, 3*np.pi/2 - np.pi/5
-    if args.folder == "25493":
-        cam_dist, cam_height = 3.4, 0.8
-    if args.folder == "26608":
-        cam_dist, cam_height = 3.2, 0.5
-    if args.folder == "45332":
-        cam_dist, cam_height = 4.0, 0.9
-        jnt_margin = 0.99
-        rotation_min, rotation_max = np.pi/2 + np.pi/4, 3*np.pi/2 - np.pi/4
-    if args.folder == "45662":
-        jnt_margin = 0.9
-    # breakpoint()
-    print(f"\nobj center: {obj_center} obj volume: {obj_volume:.2f}, cam_dist: {cam_dist:.2f}, cam_height: {cam_height:.2f}\n")
-    # breakpoint()
-    # remove temporary file
-    os.remove(tmp_fname)
-    # add link id as 'category_id' for all objects belonging to that link
-    obj.set_ascending_category_ids() 
-    fix_meshes = []
-    fix_blender_objs = []
-    for l, link in enumerate(obj.links):
-        for link_obj in link.get_visuals():
-            if link_obj.blender_obj.data.validate():
-                # print(f'had to fix {link_obj.blender_obj.name}')
-                fix_meshes.append(link_obj.blender_obj.name) 
-                fix_blender_objs.append(link_obj.blender_obj)
-                # TODO: also resample materials here 
-    # print(f"fixed {len(fix_meshes)} meshes")
+    haven_hdri_path = bproc.loader.get_random_world_background_hdr_img_path_from_haven(args.haven_path) 
 
-    num_merged = merge_export_meshs(args, obj, fname, output_path)
-    if args.merge_mesh_only: # skip rendering
-        return
-
-    # -- LIGHT --
-    init_lights = resample_lights(NUM_LIGHTS, init_lights=[], np_random=np_random)
-    # camera settings
-    bproc.camera.set_resolution(RENDER_WIDTH, RENDER_HEIGHT)   
-    bproc.renderer.enable_segmentation_output(map_by=["class"]) 
-    if RENDER_DEPTH:
-        # bproc.renderer.enable_depth_output(True, antialiasing_distance_max=10) -> gives bugs
-        bproc.renderer.enable_depth_output(False) # NOTE this should be False! True gives bad depth maps
-    if RENDER_NORMALS:
-        bproc.renderer.enable_normals_output() 
-     
     for loop in render_loops:
-        haven_hdri_path = bproc.loader.get_random_world_background_hdr_img_path_from_haven(args.haven_path) 
-        # bproc.renderer.set_output_format(enable_transparency=True)
+        if loop > 0:
+            bproc.python.utility.Initializer.clean_up(clean_up_camera= False)
+            RendererUtility.set_world_background(DefaultConfig.world_background)
+
+        # Given N frames, we determine the prismatic joint state based on loop order 
+        print(f'number of loops {render_loops}')
+        # if len(render_loops) >= 3: 
+        #     if loop == 0:
+        #         tmp_fname = clean_up_urdf(fname, np_random, open_drawer=False, margin=0.0, random_joint=False) # Fully closed prismatic joint
+        #     elif loop == len(render_loops) - 1:
+        #         tmp_fname = clean_up_urdf(fname, np_random, open_drawer=open_drawer, margin=1.0, random_joint=False) # Fully open prismatic joint
+        #     else:
+        #         tmp_fname = clean_up_urdf(fname, np_random, open_drawer=open_drawer, margin=0.5, random_joint=True) # Randomized joint of 50% marginal randomness
+        # elif len(render_loops) == 2:
+        #     if loop == 0:
+        #         tmp_fname = clean_up_urdf(fname, np_random, open_drawer=False, margin=0.0) 
+        #     elif loop == 1:
+        #         tmp_fname = clean_up_urdf(fname, np_random, open_drawer=open_drawer, margin=1.0)
+        # else:
+        #     tmp_fname = clean_up_urdf(fname, np_random, open_drawer=open_drawer, margin=0.5)
+        
+        if len(render_loops) >= 3: 
+            if loop == 0:
+                tmp_fname = clean_up_urdf(fname, np_random, open_drawer=open_drawer, margin=1.0, random_joint=False) # Fully open prismatic joint
+
+            elif loop == len(render_loops) - 1:
+                tmp_fname = clean_up_urdf(fname, np_random, open_drawer=False, margin=0.0, random_joint=False) # Fully closed prismatic joint
+            else:
+                tmp_fname = clean_up_urdf(fname, np_random, open_drawer=open_drawer, margin=0.5, random_joint=True) # Randomized joint of 50% marginal randomness
+        elif len(render_loops) == 2:
+            if loop == 0:
+                tmp_fname = clean_up_urdf(fname, np_random, open_drawer=False, margin=0.0) 
+            elif loop == 1:
+                tmp_fname = clean_up_urdf(fname, np_random, open_drawer=open_drawer, margin=1.0)
+        else:
+            tmp_fname = clean_up_urdf(fname, np_random, open_drawer=open_drawer, margin=0.5)
+        
+
+        obj = bproc.loader.load_urdf(urdf_file=tmp_fname)
+        children_bbox = []
+        for child in obj.get_children():
+            mat = child.get_local2world_mat()
+            global_corner = np.array(child.get_bound_box()) @ mat[:3, :3].T + mat[:3, 3]
+            children_bbox.append(global_corner)
+        children_bbox = np.array(children_bbox)
+        min_bound = np.min(children_bbox[:, 0, :], axis=0)
+        max_bound = np.max(children_bbox[:, 1, :], axis=0)
+        obj_center = (min_bound + max_bound) / 2
+        obj_size = max_bound - min_bound
+        obj_volume = np.prod(obj_size)
+        if obj_volume < 2:
+            cam_dist, cam_height = 3.6, 0.3
+        elif obj_volume < 3.5:
+            cam_dist, cam_height = 3.9, 0.35
+        elif obj_volume < 5:
+            cam_dist, cam_height = 3.9, 0.6
+        else: 
+            cam_dist, cam_height = 3.7, 0.7
+        
+        rotation_min, rotation_max = CAM_ROTATION_MIN, CAM_ROTATION_MAX
+        jnt_margin = 0.5
+        if args.folder == '30666':
+            cam_dist, cam_height = 3.6, 0.9
+        if args.folder == "22367":
+            cam_dist, cam_height = 3.3, 0.7 
+            rotation_min, rotation_max = np.pi/2 + np.pi/3, 3*np.pi/2 - np.pi/5
+        if args.folder == "25493":
+            cam_dist, cam_height = 3.4, 0.8
+        if args.folder == "26608":
+            cam_dist, cam_height = 3.2, 0.5
+        if args.folder == "45332":
+            cam_dist, cam_height = 4.0, 0.9
+            jnt_margin = 0.99
+            rotation_min, rotation_max = np.pi/2 + np.pi/4, 3*np.pi/2 - np.pi/4
+        if args.folder == "45662":
+            jnt_margin = 0.9
+        print(f"\nobj center: {obj_center} obj volume: {obj_volume:.2f}, cam_dist: {cam_dist:.2f}, cam_height: {cam_height:.2f}\n")
+        os.remove(tmp_fname)
+        obj.set_ascending_category_ids() 
+        fix_meshes = []
+        fix_blender_objs = []
+        for l, link in enumerate(obj.links):
+            for link_obj in link.get_visuals():
+                if link_obj.blender_obj.data.validate():
+                    fix_meshes.append(link_obj.blender_obj.name) 
+                    fix_blender_objs.append(link_obj.blender_obj)
+
+            num_merged = merge_export_meshs(args, obj, fname, output_path)
+            if args.merge_mesh_only:
+                continue
+
+        init_lights = resample_lights(NUM_LIGHTS, init_lights=[], np_random=np_random)
+        bproc.camera.set_resolution(RENDER_WIDTH, RENDER_HEIGHT)   
+        bproc.renderer.enable_segmentation_output(map_by=["class"]) 
+        if loop == 0:
+            if RENDER_DEPTH:
+                bproc.renderer.enable_depth_output(True)
+        bproc.world.set_world_background_hdr_img(haven_hdri_path, strength=2.0)
+
+        if RENDER_NORMALS:
+            bproc.renderer.enable_normals_output() 
+        # haven_hdri_path = bproc.loader.get_random_world_background_hdr_img_path_from_haven(args.haven_path) 
         if not args.render_bg:
             bpy.context.scene.render.film_transparent = True
-        # bpy.data.worlds['World'].node_tree.nodes['Background'].inputs[0].default_value = (1, 1, 1, 1)  # RGBA for white
 
-        bproc.world.set_world_background_hdr_img(haven_hdri_path, strength=2.0)
-        # save
+        # bproc.world.set_world_background_hdr_img(haven_hdri_path, strength=2.0)
         output_folder = join(output_path, f"loop_{loop}")
         if (not args.overwrite) and os.path.exists(output_folder):
             print(f"skipping {output_folder}")
             continue
         
-        joint_rots = set_hinge_joints(obj, np_random, margin=jnt_margin)
-        # resample lights
+        if len(render_loops) >= 3: 
+            if loop == 0:
+                joint_rots = set_hinge_joints(obj, np_random, margin=1.0, randomize_jnt=False, fully_open=True) # Set the revolute joint state the max joint state
+
+            elif loop == 1:
+                joint_rots = set_hinge_joints(obj, np_random, margin=jnt_margin, randomize_jnt=True, fully_open= False) # Set the revolute joint state to a randomized joint of margin 0.5
+            else: 
+                joint_rots = set_hinge_joints(obj, np_random, margin=0, randomize_jnt= False, fully_open= False) # Set the revolute joint state to 0
+
+        elif len(render_loops) == 2:
+            if loop == 0:
+                joint_rots = set_hinge_joints(obj, np_random, margin=jnt_margin, randomize_jnt=True, fully_open= False) # Set the revolute joint state to a randomized joint of margin 0.5
+
+            elif loop == 1:
+                joint_rots = set_hinge_joints(obj, np_random, margin=0, randomize_jnt= False, fully_open= False) # Set the revolute joint state to 0
+
+        else:
+            joint_rots = set_hinge_joints(obj, np_random, margin=jnt_margin, randomize_jnt=True, fully_open= False) # Set the revolute joint state to a randomized joint of margin 0.5
+
         init_lights = resample_lights(NUM_LIGHTS, init_lights=init_lights, np_random=np_random)
-        # resample cameras
-        center = (obj_center + np_random.uniform(-0.3, 0, 3))
+        center = (obj_center + np_random.uniform(-0.3, 0, 3)) # Can cnange this to center the object if needed don't know why they randomized object placement
         if args.full_circle:
             center = obj_center 
         cam_frames = resample_cameras(
@@ -537,7 +628,7 @@ def process_folder(args, folder):
             cam_distance=cam_dist, cam_height=cam_height, obj_center=center,
             rotation_min=rotation_min, rotation_max=rotation_max
         )
-        # render
+                        
         render_data = bproc.renderer.render() 
         os.makedirs(output_folder, exist_ok=True) 
         joint_rots_fname = join(output_folder, "joint_info.json")
@@ -558,16 +649,17 @@ def process_folder(args, folder):
         with open(mesh_transform_fname, "w") as f:
             json.dump(link_matrices, f, indent=4)
         save_render_data(render_data, cam_frames, output_folder, save_mask_png=args.save_mask_png)
-        
+            
     print(f"=== saved {args.num_loops} loops to {output_path} ===")
     return 
 
+
 if __name__ == "__main__": 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data_dir", default="/local/real/mandi/mobility_dataset_v2")
-    parser.add_argument('--out_dir', type=str, default="/local/real/mandi/blender_dataset_v5")
+    parser.add_argument("--data_dir", default="/media/qil/DATA/Carter_Articulated_Objects/real2code_experiments/data/partnet-mobility-v0")
+    parser.add_argument('--out_dir', type=str, default="/media/qil/DATA/Carter_Articulated_Objects/real2code_experiments/data/blender_dataset")
     parser.add_argument('--split', type=str, default="test") 
-    parser.add_argument('--folder', type=str, default="46172") 
+    parser.add_argument('--folder', type=str, default="3380") 
     parser.add_argument('--overwrite', "-o", action="store_true")
     parser.add_argument('--num_loops', type=int, default=1)
     parser.add_argument('--save_mask_png', action="store_true")
@@ -577,10 +669,13 @@ if __name__ == "__main__":
     parser.add_argument('--input_urdf', type=str, default="mobility.urdf") 
     parser.add_argument('--num_frames', type=int, default=2)
     parser.add_argument('--full_circle', action="store_true")
-    parser.add_argument('--haven_path', nargs='?', default="/local/real/mandi/", help="The folder where the `hdri` folder can be found, to load an world environment")
+    parser.add_argument('--haven_path', nargs='?', default="/media/qil/DATA/Carter_Articulated_Objects/real2code_experiments/hdri", help="The folder where the `hdri` folder can be found, to load an world environment")
     parser.add_argument('--render_bg', action="store_true")
     args = parser.parse_args()
-    bproc.init()
+    # bproc.init()
+    bproc.python.utility.Initializer.init(clean_up_scene=True)
+
+    
     process_folder(args, args.folder)
     exit()
  
