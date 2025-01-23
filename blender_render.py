@@ -16,6 +16,7 @@ import bpy
 from bpy import context
 from PIL import Image
 import trimesh
+# from scipy.spatial.transform import Rotation as R
 import json 
 
 """ 
@@ -40,9 +41,10 @@ for FOLDER in 19855 20985 22241 22301 22433 25493 26387 26652; do blenderproc ru
 for FOLDER in 40417 44781 44817 44853 44962 45243 45248 45271 45332 45423 45505 45523 45662 45693 45694 45699 45747 45779 45922 45940 46172 46762 46787 46955 47419 47742 47976 48263 48271 48356 48467 48855 49025 49133; do blenderproc run blender_render.py --folder ${FOLDER} --num_loops 5 -o; done
 """
 
-NUM_LIGHTS = 6
+NUM_LIGHTS = 9 # Should be equal to the number of camera views/frames
 CAM_DISTANCE = 4 #5 
-CAM_HEIGHT = 0.1 # 0.7 # NOTE: manually set this because bproc.object.compute_poi() seems to always get a lower height
+CAM_DISTANCE_SCALING_FACTOR = 2.5
+CAM_HEIGHT = 0.1  #0.1 # 0.7 # NOTE: manually set this because bproc.object.compute_poi() seems to always get a lower height
 POI_RANGE_LOW = np.array([-0.2, -0.2, 0])
 POI_RANGE_HIGH = np.array([-0.1, -0.1, CAM_HEIGHT]) # shift it back because many drawers are open forward!
 
@@ -122,6 +124,31 @@ def clean_up_urdf(fname, np_random, open_drawer=True, margin=0.8, random_joint=F
                             xyz = np.array(xyz).astype(np.float) + _offset
                             print(xyz)
                             ori.attrib['xyz'] = ' '.join([str(x) for x in xyz])
+        elif joint.attrib['type'] == 'continuous':  # rotating joints
+            _axis = joint.find('axis').attrib['xyz']
+            _axis = np.array(_axis.split(' ')).astype(np.float)
+            
+            if open_drawer:
+                # Apply random rotation angle in radians between 0 and 2π
+                random_angle = np_random.uniform(0, 2 * np.pi)
+            else:
+                random_angle = np.pi / 2  # Default to 90 degrees (or adjust as needed)
+            
+            # Calculate the rpy based on the axis and random angle
+            rpy_values = _axis * random_angle
+            
+            origin_elem = joint.find('origin')
+            if origin_elem is not None:
+                if 'rpy' in origin_elem.attrib:
+                    # Extract existing rpy and add the new rotation
+                    existing_rpy = np.array(origin_elem.attrib['rpy'].split(' ')).astype(np.float)
+                    new_rpy = existing_rpy + rpy_values
+                else:
+                    # If no existing rpy, just use the calculated one
+                    new_rpy = rpy_values
+                
+                origin_elem.attrib['rpy'] = ' '.join([str(x) for x in new_rpy])
+                print(f"Modified joint '{joint.attrib['name']}' with new rpy: {origin_elem.attrib['rpy']}")
                                 
                     
     tmp_fname = fname.replace('.urdf', '_tmp.urdf')
@@ -185,24 +212,30 @@ def set_hinge_joints(obj, np_random, margin=0.4, randomize_jnt=True, high_margin
         if link.joint_type is None or link.joint_type == 'fixed':
             joint_rots[link_name] = None
             continue
+        
         bone = link.fk_bone
         c = get_constraint(bone=bone, constraint_name='Limit Rotation') 
         axis = link._determine_rotation_axis(bone=bone)
+        print(axis)
         
-        if link.joint_type == 'continuous':
-            max_value = {"x": 3.14, "y": 3.14, "z": 3.14}
-            min_value = {"x": -3.14, "y": -3.14, "z": -3.14}
-            if randomize_jnt:
-                   value = (
-                    np_random.uniform(-3.14, 3.14),
-                    np_random.uniform(-3.14, 3.14),
-                    np_random.uniform(-3.14, 3.14)
-                )
-            else:
-                value = (0, 0, 0)  # Default to 0 if not randomizing
-            link.set_rotation_euler_fk(rotation_euler=value)
-            joint_rots[link_name] = value
-        elif c is not None and link.joint_type == 'revolute':
+        # if link.joint_type == 'continuous':
+        #     print(f'Joint Type: continuous, bone constraints= {c}, bone={bone}')
+        #     max_value = {"x": 3.14, "y": 3.14, "z": 3.14}
+        #     min_value = {"x": 0, "y": 0, "z": 0}
+        #     randomize_jnt= True
+        #     if randomize_jnt:
+        #            value = (
+        #             np_random.uniform(0, 2 * np.pi),
+        #             np_random.uniform(0, 2 * np.pi),
+        #             np_random.uniform(0, 2 * np.pi)
+        #         )
+        #     else:
+        #         value = (0, 0, 0)  # Default to 0 if not randomizing
+            
+        #     print(value)
+        #     link.set_rotation_euler_fk(rotation_euler=value, mode="relative")
+        #     joint_rots[link_name] = value
+        if c is not None and link.joint_type == 'revolute':
             max_value = {"x": c.max_x, "y": c.max_y, "z": c.max_z}[axis.lower()]
             min_value = {"x": c.min_x, "y": c.min_y, "z": c.min_z}[axis.lower()]
             # set rotation NOTE possible that max_value == 0, min_value is negative 
@@ -235,7 +268,7 @@ def set_hinge_joints(obj, np_random, margin=0.4, randomize_jnt=True, high_margin
             joint_rots[link_name] = None
     return joint_rots
 
-def resample_lights(num_lights, init_lights=[], np_random=np.random.RandomState(0)):
+def resample_lights(num_lights, init_lights=[], np_random=np.random.RandomState(0), CAM_DISTANCE= CAM_DISTANCE):
     lights = init_lights
     # # add one overhead fixed light
     # light = bproc.types.Light()
@@ -255,32 +288,90 @@ def resample_lights(num_lights, init_lights=[], np_random=np.random.RandomState(
         light = bproc.types.Light()
         light.set_type("SUN")
         light.set_location(np.array([0, 0, 4.5]) + np_random.uniform(-0.5, 0.5))
-        light.set_energy(20)
+        light.set_energy(1000)
         light.set_color([1, 1, 1])
         lights.append(light)
+        
+        # add one underhead fixed light
+        light = bproc.types.Light()
+        light.set_type("SUN")
+        light.set_location(np.array([0, 0, -4.5]) + np_random.uniform(-0.5, 0.5))
+        light.set_energy(1000)
+        light.set_color([1, 1, 1])
+        lights.append(light)
+        
     light_locations = np.array([
         [-0.1, CAM_DISTANCE, CAM_DISTANCE], 
         [0, -CAM_DISTANCE, CAM_DISTANCE], 
         [-0.5, -CAM_DISTANCE, -CAM_DISTANCE], 
-        [0, CAM_DISTANCE, -CAM_DISTANCE]]
+        [0, CAM_DISTANCE, -CAM_DISTANCE],
+        [2.5, CAM_DISTANCE, -CAM_DISTANCE],
+        [2.5, -CAM_DISTANCE, -CAM_DISTANCE],
+        [-2.5, CAM_DISTANCE, -CAM_DISTANCE],
+        [-2.5, -CAM_DISTANCE, 0]
+        ]
     )
     for j, light in enumerate(lights[:-1]): 
         # random location on a sphere segment
         light.set_location(bproc.sampler.shell(
-            center=light_locations[j % 4],
+            center=light_locations[j % 7],
             # radius_min=CAM_DISTANCE*0.75,
             # radius_max=CAM_DISTANCE*1.25,
             radius_min=CAM_DISTANCE*2,
-            radius_max=CAM_DISTANCE*3,
+            radius_max=CAM_DISTANCE*5,
             elevation_min=50,
             elevation_max=60,
         ))
         # random energy
-        light.set_energy(np_random.uniform(10, 20))
+        # light.set_energy(np_random.uniform(10, 20))
+        light.set_energy(500)
         # random color
         # light.set_color(np_random.uniform([0.5, 0.5, 0.5], [1, 1, 1]))
         
     return lights 
+
+# def resample_lights(num_lights, init_lights=[], np_random=np.random.RandomState(0)):
+#     lights = init_lights
+
+#     # Define elevations: lower, eye level, and higher
+#     elevations = [-np.pi / 3, 0, np.pi / 3]  # Adjust these values as needed
+#     num_elevations = len(elevations)
+
+#     # Determine number of lights per elevation level
+#     lights_per_elevation = num_lights // num_elevations
+
+#     if len(lights) == 0:
+#         for _ in range(num_lights):
+#             light = bproc.types.Light()
+#             light.set_type("AREA")
+#             lights.append(light)
+
+#         # Add one overhead fixed light
+#         overhead_light = bproc.types.Light()
+#         overhead_light.set_type("SUN")
+#         overhead_light.set_location(np.array([0, 0, 4.5]) + np_random.uniform(-0.5, 0.5))
+#         overhead_light.set_energy(20)
+#         overhead_light.set_color([1, 1, 1])
+#         lights.append(overhead_light)
+
+#     for i, elevation in enumerate(elevations):
+#         azimuth_angles = np.linspace(0, 2 * np.pi, lights_per_elevation, endpoint=False)
+#         for j, azimuth in enumerate(azimuth_angles):
+#             idx = i * lights_per_elevation + j
+#             if idx >= len(lights) - 1:
+#                 break
+
+#             light = lights[idx]
+
+#             # Calculate the spherical coordinates
+#             x = CAM_DISTANCE * np.cos(azimuth) * np.cos(elevation)
+#             y = CAM_DISTANCE * np.sin(azimuth) * np.cos(elevation)
+#             z = CAM_DISTANCE + elevation
+
+#             light.set_location([x, y, z])
+#             light.set_energy(20)
+    
+#     return lights
 
 def save_render_data(data, camera_infos, output_path, save_mask_png=False, try_load=True):
     """ regroup data by loop, then save individually """
@@ -330,13 +421,29 @@ def save_render_data(data, camera_infos, output_path, save_mask_png=False, try_l
             with h5py.File(hdf5_path, "r") as hfile:
                 # print(hfile.keys())
                 # print(hfile['colors'].shape) (h, w, 3)
-                # print(hfile['binary_masks'].shape) (num_masks, h, w)
+                # print(hfile['depth'].shape)
+                # print(hfile['binary_masks'].shape) 
+                # print(np.array(hfile['class_segmaps']))
+                
                 num_masks = hfile['binary_masks'].shape[0]
                 txt_towrite.append(
                     f"{hdf5_path} {num_masks}"
                 )
                 img = np.array(hfile['colors'])
                 Image.fromarray(img).save(join(output_path, f"rgb_{i}.png"))
+                
+                depth_data = np.array(hfile['depth']).astype(np.uint8)
+                seg_mask = np.array(hfile['class_segmaps']).astype(np.uint8)
+                depth_data *= seg_mask
+                depth_min = np.min(depth_data)
+                depth_max = np.max(depth_data)
+                print(f'depth min: {depth_min}, depth max: {depth_max}')
+                
+                depth_data_normalized = 255 * (depth_data - depth_min) / (depth_max - depth_min)
+                depth_data_normalized = depth_data_normalized.astype(np.uint8)
+                depth_image = Image.fromarray(depth_data)
+                depth_image.save(join(output_path, f"depth_{i}.png"))
+                
                 if save_mask_png:
                     masks = np.array(hfile['binary_masks'])
                     for j, mask in enumerate(masks):
@@ -347,52 +454,114 @@ def save_render_data(data, camera_infos, output_path, save_mask_png=False, try_l
     
     return 
 
+
+# def resample_cameras(
+#         num_frames, full_circle=False, np_random=np.random.RandomState(0), cam_distance=CAM_DISTANCE, 
+#         cam_height=CAM_HEIGHT, obj_center=POI_RANGE_HIGH, rotation_min=CAM_ROTATION_MIN, rotation_max=CAM_ROTATION_MAX
+#         ):
+#     # camera will look towards this point of interest
+#     poi = obj_center
+
+#     # Determine the number of elevation levels
+#     num_elevations = 2  # Number of different elevation levels
+#     frames_per_elevation = num_frames // num_elevations  # Frames per elevation level
+
+#     # Azimuth angles for full circle or partial circle
+#     if full_circle:
+#         cam_azimuth = np.linspace(0, 2 * np.pi, frames_per_elevation, endpoint=False)
+#     else:
+#         cam_azimuth = np.linspace(rotation_min, rotation_max, frames_per_elevation)
+
+#     # Elevation levels from eye level to higher angles
+#     elevation_levels = np.linspace(0, np.pi / 8, num_elevations)  # Changes: Defined elevation levels
+
+#     frames = []
+#     # for elevation in elevation_levels:
+#     #     for azimuth in cam_azimuth:
+#     for i in range(num_elevations):
+#         for j in range(frames_per_elevation):
+#             # Calculate the spherical coordinates
+#             x = cam_distance * np.cos(cam_azimuth[j]) * np.cos(elevation_levels[i])  # Changes: Corrected spherical coordinates
+#             y = cam_distance * np.sin(cam_azimuth[j]) * np.cos(elevation_levels[i])  # Changes: Corrected spherical coordinates
+#             z = cam_distance * np.sin(elevation_levels[i]) + cam_height  # Changes: Corrected spherical coordinates
+
+#             cam_location = np.array([x, y, z])
+            
+#             # Calculate the rotation matrix to look at the object center
+#             rotation_matrix = bproc.camera.rotation_from_forward_vec(poi - cam_location)
+            
+#             # Get the transformation matrix
+#             cam2world_matrix = bproc.math.build_transformation_mat(cam_location, rotation_matrix)
+#             new_frame = bproc.camera.add_camera_pose(cam2world_matrix, frame=len(frames))
+#             cam_fov = bproc.camera.get_fov()
+#             intrinsics = bproc.camera.get_intrinsics_as_K_matrix()
+#             frames.append(
+#                 dict(
+#                     cam_id=np.array([new_frame]),
+#                     cam_fov=np.array([cam_fov[0], cam_fov[1]]),
+#                     cam_pose=cam2world_matrix,
+#                     cam_intrinsics=np.array(intrinsics),
+#                 )
+#             )
+#     return frames
+
 def resample_cameras(
-        num_frames, full_circle=False, np_random=np.random.RandomState(0), cam_distance=CAM_DISTANCE, 
-        cam_height=CAM_HEIGHT, obj_center=POI_RANGE_HIGH, rotation_min=CAM_ROTATION_MIN, rotation_max=CAM_ROTATION_MAX
+        num_frames, full_circle=True, np_random=np.random.RandomState(0), cam_distance=CAM_DISTANCE, 
+        cam_height=CAM_HEIGHT, obj_center=POI_RANGE_HIGH, rotation_min=CAM_ROTATION_MIN, rotation_max=CAM_ROTATION_MAX,
+        num_lights=NUM_LIGHTS  
         ):
     # camera will look towards this point of interest
-    # poi = bproc.object.compute_poi(obj.links[1].get_visuals()) # seems unreliable
-    # poi = np_random.uniform(POI_RANGE_LOW, POI_RANGE_HIGH)
-    poi = obj_center #+ np_random.uniform(-0.2, -0.1, 3)
+    poi = obj_center
 
-    cam_azimuth = np.linspace(
-        rotation_min + np_random.uniform(0, np.pi/6),
-        rotation_max + np_random.uniform(-1*np.pi/6, 0),
-        num_frames
-        )
+    # Determine the number of elevation levels
+    num_elevations = 2  # Number of different elevation levels
+    frames_per_elevation = num_frames // num_elevations  # Frames per elevation level
+
+    # Azimuth angles for full circle or partial circle
     if full_circle:
-        cam_azimuth = np.linspace(0+ np_random.uniform(0, np.pi/6), 2*np.pi + np_random.uniform(-1*np.pi/6, 0), num_frames)
+        cam_azimuth = np.linspace(0, 2 * np.pi, frames_per_elevation, endpoint=False)
+    else:
+        cam_azimuth = np.linspace(rotation_min, rotation_max, frames_per_elevation)
 
-    cam_location = np.array([np.cos(cam_azimuth) * cam_distance,
-                            np.sin(cam_azimuth) * cam_distance,
-                            np.ones_like(cam_azimuth) * cam_height]).T
+    # Elevation levels from eye level to higher angles
+    elevation_levels = np.linspace(np.pi / 8, np.pi / 4, num_elevations)  # Changes: Defined elevation levels
 
-    # translational random walk (added as offset to poi)
-    step_magnitude = np_random.uniform(0.04, 0.08)
-    interval_low = np_random.uniform(-0.5, 0)
-    interval_high = np_random.uniform(0, 0.5)
-    poi_drift = bproc.sampler.random_walk(
-        total_length=num_frames, dims=3, step_magnitude=step_magnitude, window_size=5, interval=[interval_low, interval_high], distribution='uniform'
-        )
     frames = []
-    for i in range(num_frames):
-        # offset poi (look-at location) and rotate camera towards this new poi
-        rotation_matrix = bproc.camera.rotation_from_forward_vec(poi + poi_drift[i] - cam_location[i])
-        # get transformation matrix
-        cam2world_matrix = bproc.math.build_transformation_mat(cam_location[i], rotation_matrix) 
-        new_frame = bproc.camera.add_camera_pose(cam2world_matrix, frame=i)
-        cam_fov = bproc.camera.get_fov()
-        intrinsics = bproc.camera.get_intrinsics_as_K_matrix()
-        frames.append(
+    lights = []  # List to store light configurations
+    for i in range(num_elevations):
+        for j in range(frames_per_elevation):
+            # Calculate the spherical coordinates
+            x = cam_distance * np.cos(cam_azimuth[j]) * np.cos(elevation_levels[i]) 
+            y = cam_distance * np.sin(cam_azimuth[j]) * np.cos(elevation_levels[i])  
+            z = cam_distance * np.sin(elevation_levels[i]) + cam_height  
+
+            cam_location = np.array([x, y, z])
+            
+            # Calculate the rotation matrix to look at the object center
+            rotation_matrix = bproc.camera.rotation_from_forward_vec(poi - cam_location)
+            
+            # Get the transformation matrix
+            cam2world_matrix = bproc.math.build_transformation_mat(cam_location, rotation_matrix)
+            new_frame = bproc.camera.add_camera_pose(cam2world_matrix, frame=len(frames))
+            cam_fov = bproc.camera.get_fov()
+            intrinsics = bproc.camera.get_intrinsics_as_K_matrix()
+            frames.append(
                 dict(
                     cam_id=np.array([new_frame]),
                     cam_fov=np.array([cam_fov[0], cam_fov[1]]),
                     cam_pose=cam2world_matrix,
                     cam_intrinsics=np.array(intrinsics),
                 )
-            ) 
-    return frames
+            )
+            # Resample lights for each frame
+            # if len(lights) == 0:
+            #     light_configs = resample_lights(num_lights=num_lights, np_random=np_random)  
+            # else:
+            #     light_configs = resample_lights(num_lights=num_lights, init_lights=lights[len(lights) - 1], np_random=np_random)  
+            # lights.append(light_configs)  
+
+    return frames, lights  
+
 
 def merge_export_meshs(args, obj, fname, output_path, merged_mesh_folder = "blender_meshes"):
     """ merge all the meshes in each link into one mesh, remove the material, and save as .obj""" 
@@ -454,6 +623,11 @@ def merge_export_meshs(args, obj, fname, output_path, merged_mesh_folder = "blen
     print(f"saved {num_merged} merged meshes and repaired urdf to {output_fname}")
     return num_merged
 
+def calculate_dynamic_camera_distance(obj_size):
+    max_dim = np.max(obj_size)  # Find the maximum dimension of the bounding box
+    cam_distance = max_dim * CAM_DISTANCE_SCALING_FACTOR  # Scale it to get a good camera distance
+    return cam_distance
+
 def process_folder(args, folder):
     if len(folder.split('/')) > 1:
         folder = folder.split('/')[-1]
@@ -486,45 +660,34 @@ def process_folder(args, folder):
         return
     
     open_drawer = True
-    haven_hdri_path = bproc.loader.get_random_world_background_hdr_img_path_from_haven(args.haven_path) 
+    # haven_hdri_path = bproc.loader.get_random_world_background_hdr_img_path_from_haven(args.haven_path) 
+    haven_hdri_path = "hdri/hdris/autumn_field_puresky/autumn_field_puresky_2k.hdr"
+    # bproc.world.set_world_background_hdr_img(haven_hdri_path, strength= 2.0)
 
     for loop in render_loops:
         if loop > 0:
-            bproc.python.utility.Initializer.clean_up(clean_up_camera= False)
+            bproc.python.utility.Initializer.clean_up(clean_up_camera= True)
             RendererUtility.set_world_background(DefaultConfig.world_background)
 
         # Given N frames, we determine the prismatic joint state based on loop order 
         print(f'number of loops {render_loops}')
-        # if len(render_loops) >= 3: 
-        #     if loop == 0:
-        #         tmp_fname = clean_up_urdf(fname, np_random, open_drawer=False, margin=0.0, random_joint=False) # Fully closed prismatic joint
-        #     elif loop == len(render_loops) - 1:
-        #         tmp_fname = clean_up_urdf(fname, np_random, open_drawer=open_drawer, margin=1.0, random_joint=False) # Fully open prismatic joint
-        #     else:
-        #         tmp_fname = clean_up_urdf(fname, np_random, open_drawer=open_drawer, margin=0.5, random_joint=True) # Randomized joint of 50% marginal randomness
-        # elif len(render_loops) == 2:
-        #     if loop == 0:
-        #         tmp_fname = clean_up_urdf(fname, np_random, open_drawer=False, margin=0.0) 
-        #     elif loop == 1:
-        #         tmp_fname = clean_up_urdf(fname, np_random, open_drawer=open_drawer, margin=1.0)
-        # else:
-        #     tmp_fname = clean_up_urdf(fname, np_random, open_drawer=open_drawer, margin=0.5)
+        # bproc.world.set_world_background_hdr_img(haven_hdri_path, strength= 2.0)
         
         if len(render_loops) >= 3: 
             if loop == 0:
                 tmp_fname = clean_up_urdf(fname, np_random, open_drawer=open_drawer, margin=1.0, random_joint=False) # Fully open prismatic joint
 
             elif loop == len(render_loops) - 1:
-                tmp_fname = clean_up_urdf(fname, np_random, open_drawer=False, margin=0.0, random_joint=False) # Fully closed prismatic joint
+                tmp_fname= clean_up_urdf(fname, np_random, open_drawer=False, margin=0.0, random_joint=False) # Fully closed prismatic joint
             else:
-                tmp_fname = clean_up_urdf(fname, np_random, open_drawer=open_drawer, margin=0.5, random_joint=True) # Randomized joint of 50% marginal randomness
+                tmp_fname= clean_up_urdf(fname, np_random, open_drawer=open_drawer, margin=0.2, random_joint=True) # Randomized joint of 50% marginal randomness
         elif len(render_loops) == 2:
             if loop == 0:
-                tmp_fname = clean_up_urdf(fname, np_random, open_drawer=False, margin=0.0) 
+                tmp_fname= clean_up_urdf(fname, np_random, open_drawer=False, margin=0.0) 
             elif loop == 1:
-                tmp_fname = clean_up_urdf(fname, np_random, open_drawer=open_drawer, margin=1.0)
+                tmp_fname= clean_up_urdf(fname, np_random, open_drawer=open_drawer, margin=1.0)
         else:
-            tmp_fname = clean_up_urdf(fname, np_random, open_drawer=open_drawer, margin=0.5)
+            tmp_fname= clean_up_urdf(fname, np_random, open_drawer=open_drawer, margin=0.5)
         
 
         obj = bproc.loader.load_urdf(urdf_file=tmp_fname)
@@ -579,22 +742,20 @@ def process_folder(args, folder):
             num_merged = merge_export_meshs(args, obj, fname, output_path)
             if args.merge_mesh_only:
                 continue
-
-        init_lights = resample_lights(NUM_LIGHTS, init_lights=[], np_random=np_random)
+        
+        cam_dist = calculate_dynamic_camera_distance(obj_size= obj_size)
+        init_lights = resample_lights(NUM_LIGHTS, init_lights=[], np_random=np_random, CAM_DISTANCE= cam_dist)
         bproc.camera.set_resolution(RENDER_WIDTH, RENDER_HEIGHT)   
         bproc.renderer.enable_segmentation_output(map_by=["class"]) 
         if loop == 0:
             if RENDER_DEPTH:
-                bproc.renderer.enable_depth_output(True)
-        bproc.world.set_world_background_hdr_img(haven_hdri_path, strength=2.0)
+                bproc.renderer.enable_depth_output(False)
 
-        if RENDER_NORMALS:
-            bproc.renderer.enable_normals_output() 
-        # haven_hdri_path = bproc.loader.get_random_world_background_hdr_img_path_from_haven(args.haven_path) 
+            if RENDER_NORMALS:
+                bproc.renderer.enable_normals_output() 
         if not args.render_bg:
             bpy.context.scene.render.film_transparent = True
 
-        # bproc.world.set_world_background_hdr_img(haven_hdri_path, strength=2.0)
         output_folder = join(output_path, f"loop_{loop}")
         if (not args.overwrite) and os.path.exists(output_folder):
             print(f"skipping {output_folder}")
@@ -619,17 +780,39 @@ def process_folder(args, folder):
         else:
             joint_rots = set_hinge_joints(obj, np_random, margin=jnt_margin, randomize_jnt=True, fully_open= False) # Set the revolute joint state to a randomized joint of margin 0.5
 
-        init_lights = resample_lights(NUM_LIGHTS, init_lights=init_lights, np_random=np_random)
-        center = (obj_center + np_random.uniform(-0.3, 0, 3)) # Can cnange this to center the object if needed don't know why they randomized object placement
+        # init_lights = resample_lights(NUM_LIGHTS, init_lights=init_lights, np_random=np_random)
+        
+        # # Find the obj center again after adjusting the joint states 
+        # children_bbox = []
+        # for child in obj.get_children():
+        #     mat = child.get_local2world_mat()
+        #     global_corner = np.array(child.get_bound_box()) @ mat[:3, :3].T + mat[:3, 3]
+        #     children_bbox.append(global_corner)
+        # children_bbox = np.array(children_bbox)
+        # min_bound = np.min(children_bbox[:, 0, :], axis=0)
+        # max_bound = np.max(children_bbox[:, 1, :], axis=0)
+        # obj_center = (min_bound + max_bound) / 2
+        
+        # Set the obj center 
+        # center = (obj_center + np_random.uniform(-0.3, 0, 3)) # Can cnange this to center the object if needed don't know why they randomized object placement
+        center = obj_center
         if args.full_circle:
             center = obj_center 
-        cam_frames = resample_cameras(
+        # cam_frames = resample_cameras(
+        #     args.num_frames, args.full_circle, np_random=np_random, 
+        #     cam_distance=cam_dist, cam_height=cam_height, obj_center=center,
+        #     rotation_min=rotation_min, rotation_max=rotation_max
+        # )
+        
+        # Get camera frames and light configurations
+        cam_frames, _ = resample_cameras(
             args.num_frames, args.full_circle, np_random=np_random, 
             cam_distance=cam_dist, cam_height=cam_height, obj_center=center,
-            rotation_min=rotation_min, rotation_max=rotation_max
-        )
+            rotation_min=rotation_min, rotation_max=rotation_max,
+            num_lights=NUM_LIGHTS
+        )       
                         
-        render_data = bproc.renderer.render() 
+        render_data = bproc.renderer.render()       
         os.makedirs(output_folder, exist_ok=True) 
         joint_rots_fname = join(output_folder, "joint_info.json")
         with open(joint_rots_fname, "w") as f:

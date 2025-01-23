@@ -297,4 +297,4 @@ dependencies:
       - widgetsnbextension==4.0.9
       - wrapt==1.16.0
       - zipp==3.17.0
-prefix: /home/mandi/miniconda3/envs/real2code
+prefix: /media/qil/DATA/miniconda3/envs/real2code
